@@ -1,13 +1,14 @@
 import { bytesToHex, hexToBytes, nowMs } from '../utils/hex'
 import { type SearchTarget } from '../searchTarget'
 import { createWorkerPool, type WorkerPool } from '../worker/pool'
-import { createGpuMatcher, GPU_MATCHER_MAX_BATCH_SIZE, type GpuMatcher } from '../webgpu/gpuMatcher'
+import { ed25519 } from '@noble/curves/ed25519.js'
+import { createGpuVanityPool, type GpuHit, type GpuVanity, type GpuVanityPool } from '../gpu/gpuVanity'
+import { compilePattern } from '../gpu/precompute'
 import { keypairArrayFromPriv, secretKeyBase58FromPriv } from '../wallet/keypairJson'
 import { type PrivKey32 } from '../wallet/keys'
 import {
   BASE58_ALPHABET,
   bytesToBase58,
-  hasCaseInsensitiveVariant,
   matchesVanityTarget,
   sanitizeBase58Input,
 } from '../wallet/solanaAddress'
@@ -19,10 +20,10 @@ type RunState =
   | { status: 'running'; startedAtMs: number; generated: number; speed: number }
   | { status: 'found'; generated: number; time: number; foundPriv: PrivKey32; foundAddress: string }
 
-type GeneratedBatch = Awaited<ReturnType<WorkerPool['generate']>>
-
 const PREVIEW_LENGTH = 44
 let cachedBackend: Backend | null = null
+// Kept between searches: building the GPU pipeline takes a second or two.
+let gpuPool: GpuVanityPool | null = null
 
 function forcedBackendFromEnv(): Backend | null {
   const value = import.meta.env.VITE_FORCE_BACKEND?.trim().toLowerCase()
@@ -32,11 +33,12 @@ function forcedBackendFromEnv(): Backend | null {
 }
 
 function formatNumber(n: number): string {
+  if (n >= 1e15) return n.toExponential(1).replace('e+', 'e')
   if (n >= 1e12) return (n / 1e12).toFixed(1) + 'T'
   if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B'
   if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M'
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
-  return n.toLocaleString()
+  return Math.round(n).toLocaleString()
 }
 
 function formatTime(seconds: number): string {
@@ -47,27 +49,34 @@ function formatTime(seconds: number): string {
   return `${(seconds / 31536000).toFixed(1)}y`
 }
 
-function calculateDifficulty(prefix: string, suffix: string, caseSensitive: boolean): number {
-  const pattern = prefix + suffix
-  if (pattern.length === 0) return 1
+type PatternInfo = { difficulty: number; error: null } | { difficulty: null; error: string }
 
-  let difficulty = Math.pow(58, pattern.length)
-  if (!caseSensitive) {
-    let variants = 1
-    for (const ch of pattern) {
-      if (hasCaseInsensitiveVariant(ch)) variants *= 2
+let lastPatternKey = ''
+let lastPatternInfo: PatternInfo = { difficulty: 1, error: null }
+
+/** Expected keys per match, or why the pattern can't be searched. */
+function patternInfo(prefix: string, suffix: string, caseSensitive: boolean): PatternInfo {
+  const key = `${prefix}|${suffix}|${caseSensitive}`
+  if (key !== lastPatternKey) {
+    lastPatternKey = key
+    try {
+      lastPatternInfo = { difficulty: Math.max(1, compilePattern(prefix, suffix, caseSensitive).difficulty), error: null }
+    } catch (err) {
+      lastPatternInfo = { difficulty: null, error: err instanceof Error ? err.message : String(err) }
     }
-    difficulty = difficulty / variants
   }
+  return lastPatternInfo
+}
 
-  return Math.max(1, difficulty)
+function etaLabel(info: PatternInfo, speed: number): string {
+  if (info.error !== null) return info.error.startsWith('Too many') ? 'Too complex' : 'Impossible'
+  return estimateTime(info.difficulty, speed)
 }
 
 function estimateTime(difficulty: number, speed: number): string {
   if (speed === 0) return '-'
-  const avgAttempts = difficulty / 2
-  const seconds = avgAttempts / speed
-  return '~' + formatTime(seconds)
+  // Every key is an independent 1-in-difficulty try, so this is the mean wait.
+  return '~' + formatTime(difficulty / speed)
 }
 
 function targetPreviewLabel(target: SearchTarget): string {
@@ -145,7 +154,7 @@ export function initApp(root: HTMLDivElement) {
       <div class="input-group">
         <div class="field">
           <label for="prefix">Prefix</label>
-          <input type="text" id="prefix" placeholder="Sol" spellcheck="false" autocomplete="off">
+          <input type="text" id="prefix" placeholder="Moon" spellcheck="false" autocomplete="off">
         </div>
         <div class="field">
           <label for="suffix">Suffix</label>
@@ -219,7 +228,7 @@ export function initApp(root: HTMLDivElement) {
 
     <div class="footer">
       <div>All computations run locally in your browser. For maximum security, disconnect from the internet before generating.</div>
-      <div class="built-by">Built by <a href="https://x.com/snapss" target="_blank" rel="noopener">@snapss</a> & <a href="https://claude.ai" target="_blank" rel="noopener">Claude</a></div>
+      <div class="built-by">Built by <a href="https://x.com/snapsnocaps" target="_blank" rel="noopener">@snapsnocaps</a> & <a href="https://claude.ai" target="_blank" rel="noopener">Claude</a></div>
       <div class="open-source"><a href="https://github.com/HODL-Community/vanity-sol-gpu" target="_blank" rel="noopener">Open Source</a> on GitHub</div>
       <div class="donate">Donate: <span class="donate-addr">6EhCF2jMxB3723MuZ5jUSFTuyLsjKFoQmQCap9ZBBqFJ</span><button class="copy-btn-small" id="copy-donate">Copy</button></div>
     </div>
@@ -249,6 +258,8 @@ export function initApp(root: HTMLDivElement) {
 
   let runState: RunState = { status: 'idle' }
   let stopRequested = false
+  // True from Generate until run() has fully unwound (a found key flips runState first).
+  let runInProgress = false
   let lastFound: { priv: PrivKey32; targetAddress: string; target: SearchTarget } | null = null
 
   function selectedTarget(): SearchTarget {
@@ -286,11 +297,11 @@ export function initApp(root: HTMLDivElement) {
 
     previewAddr.innerHTML = `<span class="match">${prefix}</span>${mid}<span class="match">${suffix}</span>`
 
-    const difficulty = calculateDifficulty(prefix, suffix, caseSensitiveInput.checked)
-    if (runState.status === 'running' && runState.speed > 0) {
-      statEta.textContent = estimateTime(difficulty, runState.speed)
+    const info = patternInfo(prefix, suffix, caseSensitiveInput.checked)
+    if (info.error !== null || (runState.status === 'running' && runState.speed > 0)) {
+      statEta.textContent = etaLabel(info, runState.status === 'running' ? runState.speed : 0)
     } else {
-      statEta.textContent = `1 in ${formatNumber(difficulty)}`
+      statEta.textContent = `1 in ${formatNumber(info.difficulty)}`
     }
   }
 
@@ -301,8 +312,7 @@ export function initApp(root: HTMLDivElement) {
 
       const prefix = sanitizeBase58Input(prefixInput.value)
       const suffix = sanitizeBase58Input(suffixInput.value)
-      const difficulty = calculateDifficulty(prefix, suffix, caseSensitiveInput.checked)
-      statEta.textContent = estimateTime(difficulty, runState.speed)
+      statEta.textContent = etaLabel(patternInfo(prefix, suffix, caseSensitiveInput.checked), runState.speed)
       return
     }
 
@@ -310,131 +320,6 @@ export function initApp(root: HTMLDivElement) {
       statChecked.textContent = formatNumber(runState.generated)
       statEta.textContent = `Found in ${formatTime(runState.time)}`
     }
-  }
-
-  function getHybridTaskSplit(workerCount: number): { gpuTasks: number; cpuTasks: number } {
-    if (workerCount <= 1) return { gpuTasks: 1, cpuTasks: 0 }
-
-    const cpuTasks = Math.max(1, Math.floor(workerCount / 3))
-    const gpuTasks = Math.max(1, workerCount - cpuTasks)
-    return { gpuTasks, cpuTasks }
-  }
-
-  function getGpuBatchPerTask(gpuTasks: number): number {
-    const maxPerTask = Math.floor(GPU_MATCHER_MAX_BATCH_SIZE / Math.max(1, gpuTasks))
-    const aligned = Math.max(256, Math.floor(maxPerTask / 256) * 256)
-    return Math.max(256, Math.min(4096, aligned))
-  }
-
-  function combineGeneratedBatches(batches: GeneratedBatch[]): GeneratedBatch {
-    let totalChecked = 0
-    for (const batch of batches) totalChecked += batch.checked
-
-    const privKeys = new Uint8Array(new ArrayBuffer(totalChecked * 32))
-    const pubKeys = new Uint8Array(new ArrayBuffer(totalChecked * 32))
-
-    let writeOffset = 0
-    for (const batch of batches) {
-      const byteOffset = writeOffset * 32
-      privKeys.set(batch.privKeys, byteOffset)
-      pubKeys.set(batch.pubKeys, byteOffset)
-      writeOffset += batch.checked
-    }
-
-    return { checked: totalChecked, privKeys, pubKeys }
-  }
-
-  async function benchmarkBackend(pool: WorkerPool): Promise<{ backend: Backend; gpuMatcher: GpuMatcher | null }> {
-    if (cachedBackend === 'cpu') {
-      return { backend: 'cpu', gpuMatcher: null }
-    }
-
-    let gpuMatcher: GpuMatcher | null = null
-    try {
-      gpuMatcher = await createGpuMatcher()
-    } catch {
-      cachedBackend = 'cpu'
-      return { backend: 'cpu', gpuMatcher: null }
-    }
-
-    const BENCH_DURATION_MS = 1200
-    const CPU_BENCH_BATCH_SIZE = 1024
-    const impossiblePrefix = 'zzzzzzzzzzzzzz'
-    const impossibleSuffix = 'zzzzzzzzzz'
-    const { gpuTasks, cpuTasks } = getHybridTaskSplit(pool.workerCount)
-    const gpuBatchPerTask = getGpuBatchPerTask(gpuTasks)
-
-    let gpuChecked = 0
-    subtitleEl.textContent = 'Benchmarking GPU...'
-    const gpuStart = nowMs()
-
-    while (nowMs() - gpuStart < BENCH_DURATION_MS && !stopRequested) {
-      const generatedPromises = []
-      for (let i = 0; i < gpuTasks; i++) {
-        generatedPromises.push(pool.generate(gpuBatchPerTask))
-      }
-
-      const cpuPromises = []
-      for (let i = 0; i < cpuTasks; i++) {
-        cpuPromises.push(pool.search(impossiblePrefix, impossibleSuffix, CPU_BENCH_BATCH_SIZE, 'wallet', true))
-      }
-
-      const [generated, cpuResults] = await Promise.all([
-        Promise.all(generatedPromises),
-        Promise.all(cpuPromises),
-      ])
-
-      const combined = combineGeneratedBatches(generated)
-      if (combined.checked > 0) {
-        await gpuMatcher.findMatchIndex(combined.pubKeys, combined.checked, impossiblePrefix, impossibleSuffix, true)
-        gpuChecked += combined.checked
-      }
-
-      for (const result of cpuResults) {
-        gpuChecked += result.checked
-      }
-    }
-
-    if (stopRequested) {
-      gpuMatcher.destroy()
-      return { backend: 'cpu', gpuMatcher: null }
-    }
-
-    let cpuChecked = 0
-    subtitleEl.textContent = 'Benchmarking CPU...'
-    const cpuStart = nowMs()
-
-    while (nowMs() - cpuStart < BENCH_DURATION_MS && !stopRequested) {
-      const searches = []
-      for (let i = 0; i < pool.workerCount; i++) {
-        searches.push(pool.search(impossiblePrefix, impossibleSuffix, CPU_BENCH_BATCH_SIZE, 'wallet', true))
-      }
-
-      const results = await Promise.all(searches)
-      for (const result of results) cpuChecked += result.checked
-    }
-
-    if (stopRequested) {
-      gpuMatcher.destroy()
-      return { backend: 'cpu', gpuMatcher: null }
-    }
-
-    const gpuSpeed = gpuChecked / Math.max((nowMs() - gpuStart) / 1000, 0.001)
-    const cpuSpeed = cpuChecked / Math.max((nowMs() - cpuStart) / 1000, 0.001)
-
-    const winner: Backend = gpuSpeed > cpuSpeed ? 'gpu' : 'cpu'
-    cachedBackend = winner
-
-    if (winner === 'cpu') {
-      gpuMatcher.destroy()
-      subtitleEl.textContent = `HYBRID: ${formatNumber(Math.round(gpuSpeed))}/s | CPU: ${formatNumber(Math.round(cpuSpeed))}/s → Using CPU`
-      await new Promise(resolve => setTimeout(resolve, 1200))
-      return { backend: 'cpu', gpuMatcher: null }
-    }
-
-    subtitleEl.textContent = `HYBRID: ${formatNumber(Math.round(gpuSpeed))}/s | CPU: ${formatNumber(Math.round(cpuSpeed))}/s → Using HYBRID`
-    await new Promise(resolve => setTimeout(resolve, 1200))
-    return { backend: 'gpu', gpuMatcher }
   }
 
   async function runCpuBackend(
@@ -459,15 +344,15 @@ export function initApp(root: HTMLDivElement) {
       const results = await Promise.all(searches)
       let totalChecked = 0
 
+      for (const result of results) totalChecked += result.checked
+      if (runState.status === 'running') {
+        runState = { ...runState, generated: runState.generated + totalChecked }
+      }
+
       for (const result of results) {
-        totalChecked += result.checked
         if (result.found && runState.status === 'running') {
           handleFound(result.found.privHex, result.found.address, prefix, suffix, target, caseSensitive)
         }
-      }
-
-      if (runState.status === 'running') {
-        runState = { ...runState, generated: runState.generated + totalChecked }
       }
       recentGenerated += totalChecked
 
@@ -482,83 +367,106 @@ export function initApp(root: HTMLDivElement) {
     }
   }
 
+  async function acquireGpu(): Promise<GpuVanityPool | null> {
+    if (gpuPool) return gpuPool
+    if (cachedBackend === 'cpu' || !navigator.gpu) return null
+    subtitleEl.textContent = 'Preparing GPU...'
+    let pool: GpuVanityPool
+    try {
+      pool = await createGpuVanityPool()
+    } catch {
+      cachedBackend = 'cpu'
+      return null
+    }
+    // Only keep GPUs that pass the known-answer test on this driver.
+    subtitleEl.textContent = 'Verifying GPU...'
+    const passed: GpuVanity[] = []
+    for (const gpu of pool.instances) {
+      const err = await gpu.selfTest()
+      if (err) {
+        console.warn(`[vanity] ${gpu.label} failed self-test: ${err}`)
+        gpu.destroy()
+      } else {
+        passed.push(gpu)
+      }
+    }
+    if (passed.length === 0) {
+      cachedBackend = 'cpu'
+      return null
+    }
+    gpuPool = { instances: passed, labels: passed.map(g => g.label), destroy: () => passed.forEach(g => g.destroy()) }
+    cachedBackend = 'gpu'
+    return gpuPool
+  }
+
+  function dropGpu() {
+    gpuPool?.destroy()
+    gpuPool = null
+    cachedBackend = 'cpu'
+  }
+
+  /** Returns false if the GPU failed mid-run and the caller should continue on the CPU. */
   async function runGpuBackend(
-    pool: WorkerPool,
-    gpuMatcher: GpuMatcher,
+    pool: GpuVanityPool,
     prefix: string,
     suffix: string,
     target: SearchTarget,
     caseSensitive: boolean
-  ) {
-    const { gpuTasks, cpuTasks } = getHybridTaskSplit(pool.workerCount)
-    const gpuBatchPerTask = getGpuBatchPerTask(gpuTasks)
-    const cpuBatchPerTask = 1024
-    subtitleEl.textContent = `Running hybrid (${gpuTasks} GPU-feed workers + ${cpuTasks} CPU workers)`
+  ): Promise<boolean> {
+    const pattern = compilePattern(prefix, suffix, caseSensitive)
+    const names = pool.labels.join(' + ')
+    subtitleEl.textContent = `Running on GPU (${names})`
 
     let recentGenerated = 0
     let recentStartMs = nowMs()
+    let failed = false
 
-    while (!stopRequested && runState.status === 'running') {
-      const generatedPromises = []
-      for (let i = 0; i < gpuTasks; i++) {
-        generatedPromises.push(pool.generate(gpuBatchPerTask))
-      }
-
-      const cpuSearchPromises = []
-      for (let i = 0; i < cpuTasks; i++) {
-        cpuSearchPromises.push(pool.search(prefix, suffix, cpuBatchPerTask, target, caseSensitive))
-      }
-
-      const [batches, cpuResults] = await Promise.all([
-        Promise.all(generatedPromises),
-        Promise.all(cpuSearchPromises),
-      ])
-
-      let totalChecked = 0
-      const combined = combineGeneratedBatches(batches)
-      totalChecked += combined.checked
-
-      if (combined.checked > 0 && runState.status === 'running') {
-        const matchIndex = await gpuMatcher.findMatchIndex(
-          combined.pubKeys,
-          combined.checked,
-          prefix,
-          suffix,
-          caseSensitive,
-        )
-
-        if (matchIndex !== null && runState.status === 'running') {
-          const privOffset = matchIndex * 32
-          const priv = combined.privKeys.subarray(privOffset, privOffset + 32)
-          const pub = combined.pubKeys.subarray(privOffset, privOffset + 32)
-          handleFound(bytesToHex(priv), bytesToBase58(pub), prefix, suffix, target, caseSensitive)
-        }
-      }
-
-      for (const result of cpuResults) {
-        totalChecked += result.checked
-        if (result.found && runState.status === 'running') {
-          handleFound(result.found.privHex, result.found.address, prefix, suffix, target, caseSensitive)
-        }
-      }
-
-      if (runState.status === 'running') {
-        runState = { ...runState, generated: runState.generated + totalChecked }
-      }
-      recentGenerated += totalChecked
-
+    const report = (checked: number) => {
+      if (runState.status !== 'running') return
+      runState = { ...runState, generated: runState.generated + checked }
+      recentGenerated += checked
       const elapsed = nowMs() - recentStartMs
-      if (elapsed >= 500 && runState.status === 'running') {
-        const speed = Math.floor(recentGenerated / (elapsed / 1000))
-        runState = { ...runState, speed }
+      if (elapsed >= 500) {
+        runState = { ...runState, speed: Math.floor(recentGenerated / (elapsed / 1000)) }
         recentGenerated = 0
         recentStartMs = nowMs()
         updateStats()
       }
     }
+
+    // Every GPU hit is re-derived on the CPU before it is shown.
+    const verify = (hit: GpuHit) => {
+      const address = bytesToBase58(ed25519.getPublicKey(hit.seed))
+      if (address !== bytesToBase58(hit.pub) || !matchesVanityTarget(address, prefix, suffix, caseSensitive)) return
+      handleFound(bytesToHex(hit.seed), address, prefix, suffix, target, caseSensitive)
+    }
+
+    await Promise.all(pool.instances.map(async (gpu) => {
+      try {
+        gpu.start(pattern)
+        while (!stopRequested && runState.status === 'running' && !failed) {
+          const { checked, hits } = await gpu.step()
+          report(checked)
+          for (const hit of hits) if (runState.status === 'running') verify(hit)
+        }
+      } catch (err) {
+        console.warn(`[vanity] ${gpu.label} stopped: ${err instanceof Error ? err.message : String(err)}`)
+        failed = true
+      } finally {
+        await gpu.drain().catch(() => {})
+      }
+    }))
+
+    if (failed) {
+      dropGpu()
+      return false
+    }
+    return true
   }
 
   async function run() {
+    if (runInProgress) return
+    runInProgress = true
     stopRequested = false
     btnGenerate.textContent = 'Stop'
     btnGenerate.classList.add('running')
@@ -575,6 +483,7 @@ export function initApp(root: HTMLDivElement) {
     const caseSensitive = caseSensitiveInput.checked
 
     if (prefix.length + suffix.length === 0 || prefix.length + suffix.length > PREVIEW_LENGTH) {
+      runInProgress = false
       setInputsDisabled(false, prefixInput, suffixInput, searchTargetInputs, caseSensitiveInput)
       btnGenerate.textContent = 'Generate'
       btnGenerate.classList.remove('running')
@@ -582,54 +491,47 @@ export function initApp(root: HTMLDivElement) {
       return
     }
 
-    const pool = createWorkerPool()
-    let gpuMatcher: GpuMatcher | null = null
+    const patternError = patternInfo(prefix, suffix, caseSensitive).error
+
+    let pool: WorkerPool | null = null
     const forcedBackend = forcedBackendFromEnv()
-    let backend: Backend = forcedBackend ?? cachedBackend ?? 'cpu'
 
     const startedAtMs = nowMs()
     runState = { status: 'running', startedAtMs, generated: 0, speed: 0 }
 
     try {
-      if (!forcedBackend && cachedBackend === null) {
-        const benchmark = await benchmarkBackend(pool)
-        backend = benchmark.backend
-        gpuMatcher = benchmark.gpuMatcher
-      }
+      if (patternError) return
 
+      const gpu = forcedBackend === 'cpu' ? null : await acquireGpu()
       if (stopRequested || runState.status !== 'running') return
 
-      if (backend === 'gpu' && !gpuMatcher) {
-        try {
-          gpuMatcher = await createGpuMatcher()
-        } catch {
-          backend = 'cpu'
-          if (!forcedBackend) cachedBackend = 'cpu'
-          subtitleEl.textContent = 'GPU unavailable, falling back to CPU'
-          await new Promise(resolve => setTimeout(resolve, 1000))
-        }
+      // Which backend ran last, for diagnostics and the E2E tests.
+      root.dataset.backend = gpu ? 'gpu' : 'cpu'
+      if (gpu && await runGpuBackend(gpu, prefix, suffix, target, caseSensitive)) return
+      if (gpu) {
+        subtitleEl.textContent = 'GPU stopped responding, continuing on CPU'
+        await new Promise(resolve => setTimeout(resolve, 1000))
       }
+      if (stopRequested || runState.status !== 'running') return
 
-      if (backend === 'gpu' && gpuMatcher) {
-        await runGpuBackend(pool, gpuMatcher, prefix, suffix, target, caseSensitive)
-      } else {
-        await runCpuBackend(pool, prefix, suffix, target, caseSensitive)
-      }
+      root.dataset.backend = 'cpu'
+      pool = createWorkerPool()
+      await runCpuBackend(pool, prefix, suffix, target, caseSensitive)
     } finally {
-      pool.destroy()
-      gpuMatcher?.destroy()
+      pool?.destroy()
 
       setInputsDisabled(false, prefixInput, suffixInput, searchTargetInputs, caseSensitiveInput)
 
       const finalStatus = (runState as RunState).status
       if (finalStatus !== 'found') {
         runState = { status: 'idle' }
-        subtitleEl.textContent = 'Fast Solana vanity address generator'
+        subtitleEl.textContent = patternError ?? 'Fast Solana vanity address generator'
       }
 
       btnGenerate.textContent = 'Generate'
       btnGenerate.classList.remove('running')
       previewEl.classList.remove('generating')
+      runInProgress = false
     }
   }
 
@@ -687,7 +589,7 @@ export function initApp(root: HTMLDivElement) {
   })
 
   btnGenerate.addEventListener('click', () => {
-    if (runState.status === 'running') {
+    if (runInProgress) {
       stopRequested = true
     } else {
       void run()
