@@ -49,17 +49,31 @@ function formatTime(seconds: number): string {
   return `${(seconds / 31536000).toFixed(1)}y`
 }
 
-/** Expected keys per match, or Infinity if no key can match. */
-function calculateDifficulty(prefix: string, suffix: string, caseSensitive: boolean): number {
-  try {
-    return Math.max(1, compilePattern(prefix, suffix, caseSensitive).difficulty)
-  } catch {
-    return Infinity
+type PatternInfo = { difficulty: number; error: null } | { difficulty: null; error: string }
+
+let lastPatternKey = ''
+let lastPatternInfo: PatternInfo = { difficulty: 1, error: null }
+
+/** Expected keys per match, or why the pattern can't be searched. */
+function patternInfo(prefix: string, suffix: string, caseSensitive: boolean): PatternInfo {
+  const key = `${prefix}|${suffix}|${caseSensitive}`
+  if (key !== lastPatternKey) {
+    lastPatternKey = key
+    try {
+      lastPatternInfo = { difficulty: Math.max(1, compilePattern(prefix, suffix, caseSensitive).difficulty), error: null }
+    } catch (err) {
+      lastPatternInfo = { difficulty: null, error: err instanceof Error ? err.message : String(err) }
+    }
   }
+  return lastPatternInfo
+}
+
+function etaLabel(info: PatternInfo, speed: number): string {
+  if (info.error !== null) return info.error.startsWith('Too many') ? 'Too complex' : 'Impossible'
+  return estimateTime(info.difficulty, speed)
 }
 
 function estimateTime(difficulty: number, speed: number): string {
-  if (!Number.isFinite(difficulty)) return 'Impossible'
   if (speed === 0) return '-'
   // Every key is an independent 1-in-difficulty try, so this is the mean wait.
   return '~' + formatTime(difficulty / speed)
@@ -244,6 +258,8 @@ export function initApp(root: HTMLDivElement) {
 
   let runState: RunState = { status: 'idle' }
   let stopRequested = false
+  // True from Generate until run() has fully unwound (a found key flips runState first).
+  let runInProgress = false
   let lastFound: { priv: PrivKey32; targetAddress: string; target: SearchTarget } | null = null
 
   function selectedTarget(): SearchTarget {
@@ -281,11 +297,11 @@ export function initApp(root: HTMLDivElement) {
 
     previewAddr.innerHTML = `<span class="match">${prefix}</span>${mid}<span class="match">${suffix}</span>`
 
-    const difficulty = calculateDifficulty(prefix, suffix, caseSensitiveInput.checked)
-    if (runState.status === 'running' && runState.speed > 0) {
-      statEta.textContent = estimateTime(difficulty, runState.speed)
+    const info = patternInfo(prefix, suffix, caseSensitiveInput.checked)
+    if (info.error !== null || (runState.status === 'running' && runState.speed > 0)) {
+      statEta.textContent = etaLabel(info, runState.status === 'running' ? runState.speed : 0)
     } else {
-      statEta.textContent = Number.isFinite(difficulty) ? `1 in ${formatNumber(difficulty)}` : 'Impossible'
+      statEta.textContent = `1 in ${formatNumber(info.difficulty)}`
     }
   }
 
@@ -296,8 +312,7 @@ export function initApp(root: HTMLDivElement) {
 
       const prefix = sanitizeBase58Input(prefixInput.value)
       const suffix = sanitizeBase58Input(suffixInput.value)
-      const difficulty = calculateDifficulty(prefix, suffix, caseSensitiveInput.checked)
-      statEta.textContent = estimateTime(difficulty, runState.speed)
+      statEta.textContent = etaLabel(patternInfo(prefix, suffix, caseSensitiveInput.checked), runState.speed)
       return
     }
 
@@ -427,8 +442,8 @@ export function initApp(root: HTMLDivElement) {
     }
 
     await Promise.all(pool.instances.map(async (gpu) => {
-      gpu.start(pattern)
       try {
+        gpu.start(pattern)
         while (!stopRequested && runState.status === 'running' && !failed) {
           const { checked, hits } = await gpu.step()
           report(checked)
@@ -450,6 +465,8 @@ export function initApp(root: HTMLDivElement) {
   }
 
   async function run() {
+    if (runInProgress) return
+    runInProgress = true
     stopRequested = false
     btnGenerate.textContent = 'Stop'
     btnGenerate.classList.add('running')
@@ -466,6 +483,7 @@ export function initApp(root: HTMLDivElement) {
     const caseSensitive = caseSensitiveInput.checked
 
     if (prefix.length + suffix.length === 0 || prefix.length + suffix.length > PREVIEW_LENGTH) {
+      runInProgress = false
       setInputsDisabled(false, prefixInput, suffixInput, searchTargetInputs, caseSensitiveInput)
       btnGenerate.textContent = 'Generate'
       btnGenerate.classList.remove('running')
@@ -473,12 +491,7 @@ export function initApp(root: HTMLDivElement) {
       return
     }
 
-    let patternError: string | null = null
-    try {
-      compilePattern(prefix, suffix, caseSensitive)
-    } catch (err) {
-      patternError = err instanceof Error ? err.message : String(err)
-    }
+    const patternError = patternInfo(prefix, suffix, caseSensitive).error
 
     let pool: WorkerPool | null = null
     const forcedBackend = forcedBackendFromEnv()
@@ -518,6 +531,7 @@ export function initApp(root: HTMLDivElement) {
       btnGenerate.textContent = 'Generate'
       btnGenerate.classList.remove('running')
       previewEl.classList.remove('generating')
+      runInProgress = false
     }
   }
 
@@ -575,7 +589,7 @@ export function initApp(root: HTMLDivElement) {
   })
 
   btnGenerate.addEventListener('click', () => {
-    if (runState.status === 'running') {
+    if (runInProgress) {
       stopRequested = true
     } else {
       void run()

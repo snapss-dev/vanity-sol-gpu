@@ -41,7 +41,6 @@ const SLOTS = MAX_IN_FLIGHT + 1
 // for ~2 s. The number of invocations per dispatch adapts toward this target.
 const TARGET_DISPATCH_MS = 30
 const INITIAL_WINDOW = 256
-const SELF_TEST_THREADS = 256
 
 // Build a short, human-readable label from a GPUAdapter's info.
 function adapterLabel(adapter: GPUAdapter, index: number): string {
@@ -262,10 +261,12 @@ export async function createGpuVanity(
     if (inflight.length) throw new Error('GPU search still running; drain() first')
     const seed = new Uint32Array(8)
     crypto.getRandomValues(seed)
-    const total = SELF_TEST_THREADS * K
+    // Every key matches the first pattern, so the test must fit in the results buffer.
+    const threads = Math.max(1, Math.min(256, Math.floor(CONFIG.maxResults / K)))
+    const total = threads * K
     const run = async (p: CompiledPattern) => {
       loadPattern(p)
-      submit(SELF_TEST_THREADS, seed)
+      submit(threads, seed)
       return collect(inflight.shift()!)
     }
     const key = (h: GpuHit) => bytesToBase58(h.pub)

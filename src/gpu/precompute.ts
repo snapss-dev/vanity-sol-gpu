@@ -139,7 +139,7 @@ export function compilePattern(prefix: string, suffix: string, caseSensitive: bo
       let values = [0n]
       for (const ch of rest) {
         const ds = candidates(ch, caseSensitive)
-        if (values.length * ds.length > MAX_INTERVALS) throw new Error('Prefix has too many case variants')
+        if (values.length * ds.length > MAX_INTERVALS) throw new Error('Too many case variants: turn on case-sensitive matching')
         values = values.flatMap(v => ds.map(d => v * 58n + BigInt(d)))
       }
       const k = rest.length
@@ -160,7 +160,7 @@ export function compilePattern(prefix: string, suffix: string, caseSensitive: bo
     const last = merged[merged.length - 1]
     if (last && r[0] <= last[1]) { if (r[1] > last[1]) last[1] = r[1] } else merged.push([r[0], r[1]])
   }
-  if (merged.length > MAX_INTERVALS) throw new Error('Prefix has too many case variants')
+  if (merged.length > MAX_INTERVALS) throw new Error('Too many case variants: turn on case-sensitive matching')
 
   const words = new Uint32Array(PATTERN_HEADER_WORDS + merged.length * INTERVAL_WORDS)
   let probability = 1
