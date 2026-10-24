@@ -54,7 +54,8 @@ npm run test:gpu                              # default adapter
 npm run test:gpu -- --adapter-luid=0,1234     # pick a GPU on Windows (LUIDs: chrome://gpu)
 npm run test:gpu -- --swiftshader             # CPU-emulated WebGPU (slow)
 
-# Regenerate the PNG icons and social cards
+# Regenerate favicon.svg, the PNG icons and the social cards from src/assets/icon.svg,
+# src/assets/icon-small.svg (favicon cut) and the card template in scripts/build-images.mjs
 npm run images
 
 # Run full quality gate (build + unit + e2e)

@@ -1,18 +1,20 @@
 #!/usr/bin/env node
 // Regenerate every icon and social-card image from source, rendered with the
 // installed Google Chrome so the PNGs match what browsers draw.
-//   public/favicon.svg -> favicon-16x16.png, favicon-32x32.png, apple-touch-icon.png,
-//                         android-chrome-192x192.png, android-chrome-512x512.png
-//   socialCard() below -> og-image.png, twitter-card.png (1200 x 630)
+//   src/assets/icon-small.svg -> favicon.svg, favicon-16x16.png, favicon-32x32.png
+//   src/assets/icon.svg       -> apple-touch-icon.png, android-chrome-192/512.png (and the header logo)
+//   socialCard() below        -> og-image.png, twitter-card.png (1200 x 630)
 //   npm run images
 import { readFileSync, writeFileSync } from 'node:fs'
 import { chromium } from 'playwright-core'
 
 const root = new URL('../', import.meta.url)
-const icon = readFileSync(new URL('public/favicon.svg', root), 'utf8')
+const read = (p) => readFileSync(new URL(p, root), 'utf8')
+const small = read('src/assets/icon-small.svg')
+const icon = read('src/assets/icon.svg')
 // iOS masks home-screen icons itself; transparent rounded corners would show as black.
-const fullBleed = icon.replace('<rect width="64" height="64" rx="14"', '<rect width="64" height="64" rx="0"')
-if (fullBleed === icon) throw new Error('favicon.svg: tile rect not found')
+const fullBleed = icon.replace('class="tile" width="64" height="64" rx="14"', 'class="tile" width="64" height="64" rx="0"')
+if (fullBleed === icon) throw new Error('icon.svg: tile rect not found')
 
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]+$/
 const svgImg = (svg, size) =>
@@ -62,7 +64,7 @@ function socialCard({ tagline, label, pre, mid, suf }) {
     <div class="addr"><b>${pre}</b>${mid}<b>${suf}</b></div>
   </div>
   <div class="chips">
-    <span class="chip">WebGPU-accelerated</span>
+    <span class="chip">Runs on your GPU</span>
     <span class="chip">Keys never leave your browser</span>
     <span class="chip">Wallets &amp; program IDs</span>
   </div>
@@ -71,9 +73,11 @@ function socialCard({ tagline, label, pre, mid, suf }) {
 
 const page = (html, size) => ({ html, width: size[0], height: size[1] })
 const iconPage = (svg, s) => page(`<style>html,body{margin:0;background:transparent}</style>${svgImg(svg, s)}`, [s, s])
+writeFileSync(new URL('public/favicon.svg', root), small)
+
 const targets = [
-  ['public/favicon-16x16.png', iconPage(icon, 16)],
-  ['public/favicon-32x32.png', iconPage(icon, 32)],
+  ['public/favicon-16x16.png', iconPage(small, 16)],
+  ['public/favicon-32x32.png', iconPage(small, 32)],
   ['public/apple-touch-icon.png', iconPage(fullBleed, 180)],
   ['public/android-chrome-192x192.png', iconPage(icon, 192)],
   ['public/android-chrome-512x512.png', iconPage(icon, 512)],
