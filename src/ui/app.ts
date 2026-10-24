@@ -6,6 +6,7 @@ import { createGpuVanityPool, type GpuHit, type GpuVanity, type GpuVanityPool } 
 import { compilePattern } from '../gpu/precompute'
 import { keypairArrayFromPriv, secretKeyBase58FromPriv } from '../wallet/keypairJson'
 import { type PrivKey32 } from '../wallet/keys'
+import iconSvg from '../assets/icon.svg?raw'
 import {
   BASE58_ALPHABET,
   bytesToBase58,
@@ -21,6 +22,10 @@ type RunState =
   | { status: 'found'; generated: number; time: number; foundPriv: PrivKey32; foundAddress: string }
 
 const PREVIEW_LENGTH = 44
+// The app icon (also the source of the PNG icons), inlined so it never pops in.
+const LOGO_SVG = iconSvg
+  .replace(/<!--[sS]*?-->s*/g, '')
+  .replace('<svg ', '<svg class="logo-mark" aria-hidden="true" focusable="false" ')
 let cachedBackend: Backend | null = null
 // Kept between searches: building the GPU pipeline takes a second or two.
 let gpuPool: GpuVanityPool | null = null
@@ -128,19 +133,7 @@ function setInputsDisabled(
 export function initApp(root: HTMLDivElement) {
   root.innerHTML = `
     <div class="header">
-      <div class="logo">
-        <svg viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <defs>
-            <linearGradient id="sol-glyph-gradient" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0%" stop-color="#14f195"/>
-              <stop offset="100%" stop-color="#9945ff"/>
-            </linearGradient>
-          </defs>
-          <path d="M33 22H85L75 33H23L33 22Z" fill="url(#sol-glyph-gradient)"/>
-          <path d="M25 43H77L67 54H15L25 43Z" fill="url(#sol-glyph-gradient)"/>
-          <path d="M33 64H85L75 75H23L33 64Z" fill="url(#sol-glyph-gradient)"/>
-        </svg>
-      </div>
+      <div class="logo">${LOGO_SVG}</div>
       <div class="title">Vanity SOL GPU</div>
       <div class="subtitle" id="subtitle">Fast Solana vanity address generator</div>
     </div>
