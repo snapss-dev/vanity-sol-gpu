@@ -3,21 +3,17 @@ import { bytesToHex } from '../utils/hex'
 import { bytesToBase58, matchesVanityTarget } from '../wallet/solanaAddress'
 import type { SearchTarget } from '../searchTarget'
 
-type WorkerMessage =
-  | {
-    type: 'search'
-    id: number
-    batchSize: number
-    prefix: string
-    suffix: string
-    caseSensitive: boolean
-    target: SearchTarget
-  }
-  | {
-    type: 'generate'
-    id: number
-    batchSize: number
-  }
+type SearchMessage = {
+  type: 'search'
+  id: number
+  batchSize: number
+  prefix: string
+  suffix: string
+  caseSensitive: boolean
+  // Program IDs and wallet addresses are both ed25519 public keys, so the
+  // search is the same for either target.
+  target: SearchTarget
+}
 
 type SearchWorkerResult = {
   type: 'result'
@@ -26,87 +22,23 @@ type SearchWorkerResult = {
   found: { privHex: string; address: string } | null
 }
 
-type BatchWorkerResult = {
-  type: 'batch'
-  id: number
-  checked: number
-  privKeys: Uint8Array
-  pubKeys: Uint8Array
-}
+self.onmessage = (e: MessageEvent<SearchMessage>) => {
+  const { type, id, batchSize, prefix, suffix, caseSensitive } = e.data
+  if (type !== 'search') return
 
-function generateBatch(batchSize: number): { privKeys: Uint8Array; pubKeys: Uint8Array } {
-  const privKeys = new Uint8Array(new ArrayBuffer(batchSize * 32))
-  const pubKeys = new Uint8Array(new ArrayBuffer(batchSize * 32))
-
-  crypto.getRandomValues(privKeys)
+  const seeds = new Uint8Array(batchSize * 32)
+  crypto.getRandomValues(seeds)
 
   for (let i = 0; i < batchSize; i++) {
-    const offset = i * 32
-    const seed = privKeys.subarray(offset, offset + 32)
-    const pubkey = ed25519.getPublicKey(seed)
-    pubKeys.set(pubkey, offset)
-  }
+    const seed = seeds.subarray(i * 32, i * 32 + 32)
+    const address = bytesToBase58(ed25519.getPublicKey(seed))
+    if (!matchesVanityTarget(address, prefix, suffix, caseSensitive)) continue
 
-  return { privKeys, pubKeys }
-}
-
-self.onmessage = (e: MessageEvent<WorkerMessage>) => {
-  const message = e.data
-
-  if (message.type === 'generate') {
-    const { id, batchSize } = message
-    const { privKeys, pubKeys } = generateBatch(batchSize)
-
-    const result: BatchWorkerResult = {
-      type: 'batch',
-      id,
-      checked: batchSize,
-      privKeys,
-      pubKeys,
-    }
-
-    self.postMessage(result, { transfer: [privKeys.buffer, pubKeys.buffer] })
-    return
-  }
-
-  if (message.type !== 'search') return
-
-  const { id, batchSize, prefix, suffix, caseSensitive, target } = message
-
-  const { privKeys, pubKeys } = generateBatch(batchSize)
-
-  for (let i = 0; i < batchSize; i++) {
-    const offset = i * 32
-    const seed = privKeys.subarray(offset, offset + 32)
-    const pubkey = pubKeys.subarray(offset, offset + 32)
-    const address = bytesToBase58(pubkey)
-
-    // Program ID and wallet addresses are both Solana ed25519 pubkeys.
-    const targetAddress = target === 'program' ? address : address
-
-    if (!matchesVanityTarget(targetAddress, prefix, suffix, caseSensitive)) continue
-
-    const verifyAddress = bytesToBase58(ed25519.getPublicKey(seed))
-    if (verifyAddress !== targetAddress) continue
-
-    const result: SearchWorkerResult = {
-      type: 'result',
-      id,
-      checked: i + 1,
-      found: {
-        privHex: bytesToHex(seed),
-        address: targetAddress,
-      }
-    }
+    const result: SearchWorkerResult = { type: 'result', id, checked: i + 1, found: { privHex: bytesToHex(seed), address } }
     self.postMessage(result)
     return
   }
 
-  const result: SearchWorkerResult = {
-    type: 'result',
-    id,
-    checked: batchSize,
-    found: null
-  }
+  const result: SearchWorkerResult = { type: 'result', id, checked: batchSize, found: null }
   self.postMessage(result)
 }

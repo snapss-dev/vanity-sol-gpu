@@ -20,10 +20,11 @@ test.describe('Vanity SOL GPU app', () => {
     await page.locator('#suffix').fill('1')
     await page.locator('#btn-generate').click()
 
-    await expect(page.locator('#btn-generate')).toContainText('Stop')
-    await expect(page.locator('#subtitle')).toContainText('Running on CPU')
-
+    // A 1-in-58 suffix is often found within the first few dozen keys, so check
+    // the backend via a persistent attribute rather than the transient status text.
     await expect(page.locator('#result')).toHaveClass(/visible/, { timeout: 60_000 })
+    await expect(page.locator('#app')).toHaveAttribute('data-backend', 'cpu')
+    await expect(page.locator('#btn-generate')).toContainText('Generate')
     await expect(page.locator('#subtitle')).toContainText('Match found')
 
     await page.locator('#btn-reveal').click()
